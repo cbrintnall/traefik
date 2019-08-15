@@ -1,84 +1,105 @@
 package metrics
 
 import (
-	"context"
+	"strings"
 	"time"
 
-	"github.com/containous/traefik/v2/pkg/log"
-	"github.com/containous/traefik/v2/pkg/safe"
-	"github.com/containous/traefik/v2/pkg/types"
+	"github.com/containous/traefik/log"
+	"github.com/containous/traefik/safe"
+	"github.com/containous/traefik/types"
 	kitlog "github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/metrics/dogstatsd"
 )
 
-var datadogClient = dogstatsd.New("traefik.", kitlog.LoggerFunc(func(keyvals ...interface{}) error {
-	log.WithoutContext().WithField(log.MetricsProviderName, "datadog").Info(keyvals)
-	return nil
-}))
-
+var datadogClient *dogstatsd.Dogstatsd
 var datadogTicker *time.Ticker
 
 // Metric names consistent with https://github.com/DataDog/integrations-extras/pull/64
 const (
-	ddMetricsServiceReqsName      = "service.request.total"
-	ddMetricsServiceLatencyName   = "service.request.duration"
-	ddRetriesTotalName            = "service.retries.total"
+	ddMetricsBackendReqsName      = "backend.request.total"
+	ddMetricsBackendLatencyName   = "backend.request.duration"
+	ddRetriesTotalName            = "backend.retries.total"
 	ddConfigReloadsName           = "config.reload.total"
 	ddConfigReloadsFailureTagName = "failure"
 	ddLastConfigReloadSuccessName = "config.reload.lastSuccessTimestamp"
 	ddLastConfigReloadFailureName = "config.reload.lastFailureTimestamp"
-	ddEntryPointReqsName          = "entrypoint.request.total"
-	ddEntryPointReqDurationName   = "entrypoint.request.duration"
-	ddEntryPointOpenConnsName     = "entrypoint.connections.open"
-	ddOpenConnsName               = "service.connections.open"
-	ddServerUpName                = "service.server.up"
+	ddEntrypointReqsName          = "entrypoint.request.total"
+	ddEntrypointReqDurationName   = "entrypoint.request.duration"
+	ddEntrypointOpenConnsName     = "entrypoint.connections.open"
+	ddOpenConnsName               = "backend.connections.open"
+	ddServerUpName                = "backend.server.up"
 )
 
 // RegisterDatadog registers the metrics pusher if this didn't happen yet and creates a datadog Registry instance.
-func RegisterDatadog(ctx context.Context, config *types.DataDog) Registry {
+func RegisterDatadog(config *types.Datadog) Registry {
+	tags := ParseTags(config.Tags)
+
+	if len(tags) == 0 {
+		log.Warnf("Unable to parse %s into Tags, ignoring", config.Tags)
+	} else {
+		log.Infof("Added tags %v to Datadog client", tags)
+	}
+
+	datadogClient = dogstatsd.New("traefik.", kitlog.LoggerFunc(func(keyvals ...interface{}) error {
+		log.Info(keyvals)
+		return nil
+	}), tags...)
+
 	if datadogTicker == nil {
-		datadogTicker = initDatadogClient(ctx, config)
+		datadogTicker = initDatadogClient(config)
 	}
 
 	registry := &standardRegistry{
-		configReloadsCounter:         datadogClient.NewCounter(ddConfigReloadsName, 1.0),
-		configReloadsFailureCounter:  datadogClient.NewCounter(ddConfigReloadsName, 1.0).With(ddConfigReloadsFailureTagName, "true"),
-		lastConfigReloadSuccessGauge: datadogClient.NewGauge(ddLastConfigReloadSuccessName),
-		lastConfigReloadFailureGauge: datadogClient.NewGauge(ddLastConfigReloadFailureName),
-	}
-
-	if config.AddEntryPointsLabels {
-		registry.epEnabled = config.AddEntryPointsLabels
-		registry.entryPointReqsCounter = datadogClient.NewCounter(ddEntryPointReqsName, 1.0)
-		registry.entryPointReqDurationHistogram = datadogClient.NewHistogram(ddEntryPointReqDurationName, 1.0)
-		registry.entryPointOpenConnsGauge = datadogClient.NewGauge(ddEntryPointOpenConnsName)
-	}
-
-	if config.AddServicesLabels {
-		registry.svcEnabled = config.AddServicesLabels
-		registry.serviceReqsCounter = datadogClient.NewCounter(ddMetricsServiceReqsName, 1.0)
-		registry.serviceReqDurationHistogram = datadogClient.NewHistogram(ddMetricsServiceLatencyName, 1.0)
-		registry.serviceRetriesCounter = datadogClient.NewCounter(ddRetriesTotalName, 1.0)
-		registry.serviceOpenConnsGauge = datadogClient.NewGauge(ddOpenConnsName)
-		registry.serviceServerUpGauge = datadogClient.NewGauge(ddServerUpName)
+		enabled:                        true,
+		configReloadsCounter:           datadogClient.NewCounter(ddConfigReloadsName, 1.0),
+		configReloadsFailureCounter:    datadogClient.NewCounter(ddConfigReloadsName, 1.0).With(ddConfigReloadsFailureTagName, "true"),
+		lastConfigReloadSuccessGauge:   datadogClient.NewGauge(ddLastConfigReloadSuccessName),
+		lastConfigReloadFailureGauge:   datadogClient.NewGauge(ddLastConfigReloadFailureName),
+		entrypointReqsCounter:          datadogClient.NewCounter(ddEntrypointReqsName, 1.0),
+		entrypointReqDurationHistogram: datadogClient.NewHistogram(ddEntrypointReqDurationName, 1.0),
+		entrypointOpenConnsGauge:       datadogClient.NewGauge(ddEntrypointOpenConnsName),
+		backendReqsCounter:             datadogClient.NewCounter(ddMetricsBackendReqsName, 1.0),
+		backendReqDurationHistogram:    datadogClient.NewHistogram(ddMetricsBackendLatencyName, 1.0),
+		backendRetriesCounter:          datadogClient.NewCounter(ddRetriesTotalName, 1.0),
+		backendOpenConnsGauge:          datadogClient.NewGauge(ddOpenConnsName),
+		backendServerUpGauge:           datadogClient.NewGauge(ddServerUpName),
 	}
 
 	return registry
 }
 
-func initDatadogClient(ctx context.Context, config *types.DataDog) *time.Ticker {
+func initDatadogClient(config *types.Datadog) *time.Ticker {
 	address := config.Address
 	if len(address) == 0 {
 		address = "localhost:8125"
 	}
+	pushInterval, err := time.ParseDuration(config.PushInterval)
+	if err != nil {
+		log.Warnf("Unable to parse %s into pushInterval, using 10s as default value", config.PushInterval)
+		pushInterval = 10 * time.Second
+	}
 
-	report := time.NewTicker(time.Duration(config.PushInterval))
+	report := time.NewTicker(pushInterval)
 
 	safe.Go(func() {
-		datadogClient.SendLoop(ctx, report.C, "udp", address)
+		datadogClient.SendLoop(report.C, "udp", address)
 	})
 
 	return report
+}
+
+func ParseTags(tags string) []string {
+	keyValueTags := make([]string, 0)
+
+	for _, kv := range strings.Split(tags, ",") {
+		vals := strings.Split(kv, ":")
+		// Ensure there is a key and a value
+		if len(vals) == 2 {
+			keyValueTags = append(keyValueTags, vals[0], vals[1])
+		}
+	}
+
+	return keyValueTags
 }
 
 // StopDatadog stops internal datadogTicker which controls the pushing of metrics to DD Agent and resets it to `nil`.

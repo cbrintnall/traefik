@@ -28,6 +28,7 @@ func (p *Prometheus) SetDefaults() {
 
 // DataDog contains address and metrics pushing interval configuration.
 type DataDog struct {
+	Tags                 string   `description:"Tags associated with each metric" json:"tags,omitempty" toml:"address,omitempty" yaml:"address,omitempty"`
 	Address              string   `description:"DataDog's address." json:"address,omitempty" toml:"address,omitempty" yaml:"address,omitempty"`
 	PushInterval         Duration `description:"DataDog push interval." json:"pushInterval,omitempty" toml:"pushInterval,omitempty" yaml:"pushInterval,omitempty" export:"true"`
 	AddEntryPointsLabels bool     `description:"Enable metrics on entry points." json:"addEntryPointsLabels,omitempty" toml:"addEntryPointsLabels,omitempty" yaml:"addEntryPointsLabels,omitempty" export:"true"`
